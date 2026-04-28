@@ -1,0 +1,126 @@
+// backend/middleware/security.js
+const AuditLog = require("../models/AuditLog");
+const rateLimit = require("express-rate-limit");
+
+// --- HELPER: Extract IP exactly same way for Limiter and Reset ---
+const getClientIP = (req) => {
+    if (req.headers['x-forwarded-for']) {
+        // Render/AWS puts the real client IP first in this list
+        return req.headers['x-forwarded-for'].split(',')[0].trim();
+    }
+    return req.ip;
+};
+
+// --- AUTH RATE LIMITER ---
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 10,
+    standardHeaders: true, 
+    legacyHeaders: false,
+
+    // 1. Use the custom IP extractor
+    keyGenerator: (req, res) => {
+        return getClientIP(req);
+    },
+
+    // 2. DISABLE validation checks (Fixes deployment crash)
+    validate: {
+        ip: false,              // Fixes "IPv6" error
+        trustProxy: false,      // Fixes "Trust Proxy" error
+        xForwardedForHeader: false
+    },
+
+    // 3. Custom JSON Error Message
+    handler: (req, res, next, options) => {
+        res.status(options.statusCode).json({
+            success: false,
+            message: "Too many login attempts. Please try again after 15 minutes." 
+        });
+    }
+});
+
+// --- HELPER: Reset Limit for a Request ---
+const resetAuthLimit = (req, res, next) => {
+    // FIX: We must use the EXACT same IP logic as the limiter
+    const ipKey = getClientIP(req); 
+
+    if (authLimiter) {
+        // Reset the counter for this specific IP
+        authLimiter.resetKey(ipKey);
+    }
+
+    // Manually set header to 10 to show frontend it's clear
+    res.setHeader("RateLimit-Remaining", 10);
+
+    if (next) next();
+};
+
+// --- 1. REQUIRE ADMIN (Authorization) ---
+function requireAdmin(req, res, next) {
+    if (!req.user) {
+        return res.status(401).json({ msg: "Authentication required" });
+    }
+    if (req.user.role !== "admin") {
+        logAudit(req, "UNAUTHORIZED_ACCESS_ATTEMPT", {
+            error: "Non-admin tried to access admin route",
+        });
+        return res.status(403).json({ msg: "Access denied: Admins only" });
+    }
+    next();
+}
+
+// --- 2. AUDIT LOGGER (Activity Tracking) ---
+function audit(actionName) {
+    return async (req, res, next) => {
+        res.on("finish", async () => {
+            if (req.user || res.statusCode >= 400) {
+                try {
+                    await AuditLog.create({
+                        userId: req.user ? req.user.id : null,
+                        userName: req.user ? req.user.name : "Anonymous",
+                        userRole: req.user ? req.user.role : "Guest",
+                        action: actionName || `${req.method} ${req.baseUrl}${req.path}`,
+                        method: req.method,
+                        endpoint: req.originalUrl,
+                        details: sanitizeBody(req.body),
+                        ip: getClientIP(req), // Use consistent IP helper
+                        status: res.statusCode,
+                    });
+                } catch (err) {
+                    console.error("Audit Log Error:", err);
+                }
+            }
+        });
+        next();
+    };
+}
+
+// Helper to remove passwords from logs
+function sanitizeBody(body) {
+    if (!body) return {};
+    const clean = { ...body };
+    if (clean.password) clean.password = "[REDACTED]";
+    if (clean.newPassword) clean.newPassword = "[REDACTED]";
+    return clean;
+}
+
+// Manual helper for catching unauthorized attempts inside middleware
+async function logAudit(req, action, details) {
+    try {
+        await AuditLog.create({
+            userId: req.user?.id,
+            userName: req.user?.name || "Unknown",
+            userRole: req.user?.role || "Guest",
+            action,
+            method: req.method,
+            endpoint: req.originalUrl,
+            details,
+            ip: getClientIP(req), // Use consistent IP helper
+            status: 403,
+        });
+    } catch (e) {
+        console.error(e);
+    }
+}
+
+module.exports = { requireAdmin, audit, authLimiter, resetAuthLimit };
